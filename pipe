@@ -498,6 +498,9 @@ class Pipe:
             max_workers=self.valves.THREAD_WORKERS
         )
 
+        # Cooldown flag for Ollama tokenize failures to avoid repeated 10s timeouts
+        self._ollama_tokenize_fail_until = 0.0
+
     async def initialize_research_state(
         self,
         user_message,
@@ -658,7 +661,12 @@ class Pipe:
             return 0
 
         # Try Ollama's tokenize endpoint if OLLAMA_URL is configured
-        if self.valves.OLLAMA_URL and self.valves.RESEARCH_MODEL:
+        # Skip if within cooldown period from a recent failure to avoid repeated timeouts
+        if (
+            self.valves.OLLAMA_URL
+            and self.valves.RESEARCH_MODEL
+            and time.time() >= self._ollama_tokenize_fail_until
+        ):
             try:
                 connector = aiohttp.TCPConnector(force_close=True)
                 async with aiohttp.ClientSession(connector=connector) as session:
@@ -675,12 +683,18 @@ class Pipe:
                         if response.status == 200:
                             result = await response.json()
                             tokens = result.get("tokens", [])
+                            # Reset cooldown on success
+                            self._ollama_tokenize_fail_until = 0.0
                             if len(text) > 2000:
                                 ratio = len(text) / 2000
                                 return int(len(tokens) * ratio)
                             return len(tokens)
             except Exception as e:
-                logger.debug(f"Ollama tokenize unavailable, using estimation: {e}")
+                # Set 60s cooldown to avoid repeated timeouts when Ollama is down
+                self._ollama_tokenize_fail_until = time.time() + 60
+                logger.debug(
+                    f"Ollama tokenize unavailable, using estimation for next 60s: {e}"
+                )
 
         # Fallback to simple estimation (works for all backends)
         words = text.split()
@@ -755,6 +769,33 @@ class Pipe:
                     "No app state available — cannot auto-detect embedding model. "
                     "Please configure EMBEDDING_MODEL in valve settings."
                 )
+
+        # Validate that a usable embedding backend exists
+        if self._embedding_model and self._embedding_function is None:
+            # No EMBEDDING_FUNCTION available — check if Ollama fallback is viable
+            has_ollama = bool(self.valves.OLLAMA_URL)
+            if not has_ollama and app_state is not None:
+                # Also check Open WebUI's own Ollama URL config as a signal
+                try:
+                    ollama_urls = getattr(
+                        app_state.config, "OLLAMA_BASE_URLS", None
+                    )
+                    has_ollama = bool(ollama_urls)
+                except Exception:
+                    pass
+            if not has_ollama:
+                raise ValueError(
+                    f"Embedding model '{self._embedding_model}' is configured but "
+                    f"no usable backend is available. The model does not match the "
+                    f"Open WebUI RAG embedding model, and no Ollama URL is configured "
+                    f"for fallback. Either set EMBEDDING_MODEL to match your RAG "
+                    f"embedding model (or leave it empty to auto-detect), or configure "
+                    f"OLLAMA_URL in valve settings."
+                )
+            logger.info(
+                f"Embedding model '{self._embedding_model}' will use Ollama "
+                f"fallback at {self.valves.OLLAMA_URL}"
+            )
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding for a text string using the configured embedding model with caching.
