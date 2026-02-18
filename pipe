@@ -187,25 +187,86 @@ class Pipe:
     __request__: Any
 
     class Valves(BaseModel):
+
+        @classmethod
+        def get_model_options(cls, __user__=None) -> list:
+            """Fetch available models from Open WebUI for dropdown selection."""
+            try:
+                from open_webui.models.models import Models
+
+                all_models = Models.get_all_models()
+                options = []
+                for model in all_models:
+                    model_id = model.id
+                    model_name = model.name if model.name else model_id
+                    label = (
+                        f"{model_name} ({model_id})"
+                        if model_name != model_id
+                        else model_id
+                    )
+                    options.append({"value": model_id, "label": label})
+                options.sort(key=lambda x: x["label"].lower())
+                return options
+            except Exception:
+                return []
+
+        @classmethod
+        def get_model_options_with_empty(cls, __user__=None) -> list:
+            """Fetch available models with a fallback-to-research-model option."""
+            options = [{"value": "", "label": "(Use Research Model)"}]
+            options.extend(cls.get_model_options(__user__=__user__))
+            return options
+
+        @classmethod
+        def get_embedding_model_options(cls, __user__=None) -> list:
+            """Fetch available models with an auto-detect option for embeddings."""
+            options = [{"value": "", "label": "(Auto-detect from Open WebUI)"}]
+            options.extend(cls.get_model_options(__user__=__user__))
+            return options
+
         ENABLED: bool = Field(
             default=True,
             description="Enable Deep Research pipe",
         )
         RESEARCH_MODEL: str = Field(
-            default="gemma3:12b",
+            default="",
             description="Model for generating research queries and synthesizing results",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": "get_model_options",
+                }
+            },
         )
         SYNTHESIS_MODEL: str = Field(
-            default="gemma3:27b",
-            description="Optional separate model for final synthesis (leave empty to use RESEARCH_MODEL)",
+            default="",
+            description="Optional separate model for final synthesis (leave empty to use Research Model)",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": "get_model_options_with_empty",
+                }
+            },
         )
         EMBEDDING_MODEL: str = Field(
-            default="granite-embedding:30m",
-            description="Model for semantic comparison of content",
+            default="",
+            description="Model for semantic comparison of content (leave empty to auto-detect from Open WebUI RAG settings)",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": "get_embedding_model_options",
+                }
+            },
         )
         QUALITY_FILTER_MODEL: str = Field(
-            default="gemma3:4b",
-            description="Model used for filtering irrelevant search results",
+            default="",
+            description="Model used for filtering irrelevant search results (leave empty to use Research Model)",
+            json_schema_extra={
+                "input": {
+                    "type": "select",
+                    "options": "get_model_options_with_empty",
+                }
+            },
         )
 
         QUALITY_FILTER_ENABLED: bool = Field(
@@ -290,7 +351,8 @@ class Pipe:
             default=0.6, description="Temperature for final synthesis", ge=0.0, le=2.0
         )
         OLLAMA_URL: str = Field(
-            default="http://localhost:11434", description="URL for Ollama API"
+            default="http://localhost:11434",
+            description="Ollama API URL (optional — used as fallback for embeddings and token counting. Not required for OpenAI/Azure backends)",
         )
         SEARCH_URL: str = Field(
             default="http://192.168.1.1:8888/search?q=",
@@ -591,39 +653,116 @@ class Pipe:
         return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
 
     async def count_tokens(self, text: str) -> int:
-        """Count tokens in text using Ollama API"""
+        """Count tokens in text. Tries Ollama API if available, otherwise estimates."""
         if not text:
             return 0
 
-        try:
-            # Use Ollama's tokenize endpoint with the specified model
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                payload = {
-                    "model": self.valves.RESEARCH_MODEL,
-                    "prompt": text,  # Do not limit length for token counting
-                }
+        # Try Ollama's tokenize endpoint if OLLAMA_URL is configured
+        if self.valves.OLLAMA_URL and self.valves.RESEARCH_MODEL:
+            try:
+                connector = aiohttp.TCPConnector(force_close=True)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    payload = {
+                        "model": self.valves.RESEARCH_MODEL,
+                        "prompt": text,
+                    }
 
-                async with session.post(
-                    f"{self.valves.OLLAMA_URL}/api/tokenize", json=payload, timeout=10
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        tokens = result.get("tokens", [])
-                        # If we got only a partial count due to truncation, estimate full count
-                        if len(text) > 2000:
-                            ratio = len(text) / 2000
-                            return int(len(tokens) * ratio)
-                        return len(tokens)
-        except Exception as e:
-            logger.error(f"Error counting tokens with Ollama API: {e}")
+                    async with session.post(
+                        f"{self.valves.OLLAMA_URL}/api/tokenize",
+                        json=payload,
+                        timeout=10,
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            tokens = result.get("tokens", [])
+                            if len(text) > 2000:
+                                ratio = len(text) / 2000
+                                return int(len(tokens) * ratio)
+                            return len(tokens)
+            except Exception as e:
+                logger.debug(f"Ollama tokenize unavailable, using estimation: {e}")
 
-        # Fallback to simple estimation if API call fails
+        # Fallback to simple estimation (works for all backends)
         words = text.split()
-        return int(len(words) * 1.3)  # Approximate token count using words
+        return int(len(words) * 1.3)
+
+    async def _resolve_embedding_config(self):
+        """Resolve embedding model and function based on valve settings and Open WebUI config.
+
+        Uses Open WebUI's EMBEDDING_FUNCTION when available, which supports all backends
+        (Ollama, OpenAI, Azure, SentenceTransformers). Falls back to direct Ollama API
+        calls only when EMBEDDING_FUNCTION is unavailable and OLLAMA_URL is configured.
+        """
+        self._embedding_model = None
+        self._embedding_engine = None
+        self._embedding_function = None
+
+        app_state = None
+        try:
+            if (
+                hasattr(self, "__request__")
+                and self.__request__ is not None
+                and hasattr(self.__request__, "app")
+                and hasattr(self.__request__.app, "state")
+            ):
+                app_state = self.__request__.app.state
+        except Exception as e:
+            logger.warning(f"Could not access app state: {e}")
+
+        if self.valves.EMBEDDING_MODEL:
+            # User has explicitly set an embedding model
+            self._embedding_model = self.valves.EMBEDDING_MODEL
+            if app_state is not None:
+                try:
+                    rag_model = getattr(app_state.config, "RAG_EMBEDDING_MODEL", "")
+                    if self._embedding_model == rag_model:
+                        # Same model as RAG config — reuse the pre-configured function
+                        self._embedding_function = getattr(
+                            app_state, "EMBEDDING_FUNCTION", None
+                        )
+                        self._embedding_engine = getattr(
+                            app_state.config, "RAG_EMBEDDING_ENGINE", ""
+                        )
+                except Exception as e:
+                    logger.warning(f"Could not check RAG config for embedding match: {e}")
+            logger.info(f"Using explicitly configured embedding model: {self._embedding_model}")
+        else:
+            # Auto-detect from Open WebUI RAG settings
+            if app_state is not None:
+                try:
+                    self._embedding_model = getattr(
+                        app_state.config, "RAG_EMBEDDING_MODEL", None
+                    )
+                    self._embedding_engine = getattr(
+                        app_state.config, "RAG_EMBEDDING_ENGINE", ""
+                    )
+                    self._embedding_function = getattr(
+                        app_state, "EMBEDDING_FUNCTION", None
+                    )
+                    if self._embedding_model:
+                        logger.info(
+                            f"Auto-detected embedding model from Open WebUI: "
+                            f"{self._embedding_model} (engine: {self._embedding_engine})"
+                        )
+                    else:
+                        logger.warning(
+                            "No RAG_EMBEDDING_MODEL found in Open WebUI config"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to auto-detect embedding model: {e}")
+            else:
+                logger.warning(
+                    "No app state available — cannot auto-detect embedding model. "
+                    "Please configure EMBEDDING_MODEL in valve settings."
+                )
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
-        """Get embedding for a text string using the configured embedding model with caching"""
+        """Get embedding for a text string using the configured embedding model with caching.
+
+        Uses Open WebUI's EMBEDDING_FUNCTION when available (supports all backends:
+        Ollama, OpenAI, Azure, SentenceTransformers). Falls back to direct Ollama API
+        calls only when EMBEDDING_FUNCTION is unavailable and OLLAMA_URL is configured.
+        """
         if not text or not text.strip():
             return None
 
@@ -637,36 +776,67 @@ class Pipe:
 
         # If not in cache, get from API
         try:
-            connector = aiohttp.TCPConnector(force_close=True)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                payload = {
-                    "model": self.valves.EMBEDDING_MODEL,
-                    "input": text,
-                }
+            embedding = None
 
-                async with session.post(
-                    f"{self.valves.OLLAMA_URL}/api/embed", json=payload, timeout=30
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        # Handle both old and new API response formats
-                        if "embedding" in result:
-                            embedding = result.get("embedding", [])
-                            if embedding:
-                                # Cache the result
-                                self.embedding_cache.set(text, embedding)
-                                return embedding
-                        elif "embeddings" in result and result["embeddings"]:
-                            # New format with batch response (we only sent one text, so take first)
-                            embedding = result["embeddings"][0]
-                            if embedding:
-                                # Cache the result
-                                self.embedding_cache.set(text, embedding)
-                                return embedding
-                    else:
-                        logger.warning(
-                            f"Embedding request failed with status {response.status}"
-                        )
+            # Primary path: Use Open WebUI's EMBEDDING_FUNCTION (backend-agnostic)
+            if (
+                hasattr(self, "_embedding_function")
+                and self._embedding_function is not None
+            ):
+                try:
+                    result = await self._embedding_function(text)
+                    if isinstance(result, list) and len(result) > 0:
+                        if isinstance(result[0], list):
+                            # Nested format: [[float, ...]] — take first embedding
+                            embedding = result[0]
+                        else:
+                            # Flat format: [float, ...] — single embedding
+                            embedding = result
+                except Exception as e:
+                    logger.warning(
+                        f"EMBEDDING_FUNCTION failed, will try fallback: {e}"
+                    )
+
+            # Fallback: Direct Ollama API call (for backward compatibility)
+            if embedding is None and self.valves.OLLAMA_URL:
+                embed_model = (
+                    getattr(self, "_embedding_model", None)
+                    or self.valves.EMBEDDING_MODEL
+                )
+                if embed_model:
+                    try:
+                        connector = aiohttp.TCPConnector(force_close=True)
+                        async with aiohttp.ClientSession(
+                            connector=connector
+                        ) as session:
+                            payload = {
+                                "model": embed_model,
+                                "input": text,
+                            }
+                            async with session.post(
+                                f"{self.valves.OLLAMA_URL}/api/embed",
+                                json=payload,
+                                timeout=30,
+                            ) as response:
+                                if response.status == 200:
+                                    result = await response.json()
+                                    if "embedding" in result:
+                                        embedding = result.get("embedding", [])
+                                    elif (
+                                        "embeddings" in result
+                                        and result["embeddings"]
+                                    ):
+                                        embedding = result["embeddings"][0]
+                                else:
+                                    logger.warning(
+                                        f"Ollama embedding request failed with status {response.status}"
+                                    )
+                    except Exception as e:
+                        logger.warning(f"Ollama embedding fallback failed: {e}")
+
+            if embedding:
+                self.embedding_cache.set(text, embedding)
+                return embedding
 
             return None
         except Exception as e:
@@ -5182,8 +5352,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         context += f"""Is the above content relevant to this query: "{query}"? Answer with ONLY 'Yes' or 'No'."""
 
         try:
-            # Use quality filter model
-            quality_model = self.valves.QUALITY_FILTER_MODEL
+            # Use quality filter model (falls back to research model if not set)
+            quality_model = self.valves.QUALITY_FILTER_MODEL if self.valves.QUALITY_FILTER_MODEL else self.get_research_model()
 
             response = await self.generate_completion(
                 quality_model,
@@ -5483,7 +5653,11 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
     def get_research_model(self):
         """Get the appropriate model for research/mechanical tasks"""
-        # Always use the main research model
+        if not self.valves.RESEARCH_MODEL:
+            raise ValueError(
+                "RESEARCH_MODEL is not configured. "
+                "Please select a model in the Deep Research pipe settings."
+            )
         return self.valves.RESEARCH_MODEL
 
     def get_synthesis_model(self):
@@ -5493,7 +5667,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             and self.valves.SYNTHESIS_MODEL != self.valves.RESEARCH_MODEL
         ):
             return self.valves.SYNTHESIS_MODEL
-        return self.valves.RESEARCH_MODEL
+        return self.get_research_model()
 
     async def generate_completion(
         self,
@@ -9309,6 +9483,29 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         self.__user__ = User(**__user__)
         self.__model__ = __model__
         self.__request__ = __request__
+
+        # Validate required model configuration
+        if not self.valves.RESEARCH_MODEL:
+            error_msg = (
+                "**Configuration Required:** No Research Model is selected. "
+                "Please go to the Deep Research pipe settings and select a "
+                "Research Model from the dropdown."
+            )
+            if __event_emitter__:
+                await self.__current_event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "status": "complete",
+                            "description": "Error: Research Model not configured",
+                            "done": True,
+                        },
+                    }
+                )
+            return error_msg
+
+        # Resolve embedding configuration (auto-detect or use explicit setting)
+        await self._resolve_embedding_config()
 
         # Extract conversation ID from the message history
         messages = body.get("messages", [])
